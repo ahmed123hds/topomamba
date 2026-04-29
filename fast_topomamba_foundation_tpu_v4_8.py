@@ -426,36 +426,12 @@ class SlowSelectiveScan1D(nn.Module):
         nn.init.uniform_(self.dt_proj.bias, -4, -2)
         self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1).float().unsqueeze(0).repeat(dim, 1))); self.D = nn.Parameter(torch.ones(dim)); self.out_proj = nn.Linear(dim, dim, bias=False); self.norm = nn.LayerNorm(dim)
     def forward(self, x):
-        B, L, D = x.shape
-        N = self.state_dim
-        xz = self.in_proj(x)
-        u, z = xz.chunk(2, -1)                                     # u,z: [B,L,D]
-        params = self.x_proj(u)
-        dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1)
-        delta = F.softplus(self.dt_proj(dt_raw)).clamp(max=10)     # [B,L,D]
-        A = -torch.exp(self.A_log.float()).clamp(max=1e4)           # [D,N]
-
-        # --- Vectorized scan (no Python for-loop → XLA-friendly static graph) ---
-        # dA[b,t,d,n] = exp(delta[b,t,d] * A[d,n])
-        dA = torch.exp(
-            (delta.unsqueeze(-1) * A[None, None]).clamp(-30, 30)
-        )  # [B,L,D,N]
-        # dB*u: outer product over N and D dims
-        dBu = (delta.unsqueeze(-1) * Bm.unsqueeze(2)) * u.unsqueeze(-1)  # [B,L,D,N]
-
-        # Linear recurrence h[t] = dA[t]*h[t-1] + dBu[t], h[-1]=0
-        # Solved via log-space prefix-product cumsum (fully vectorised):
-        #   cumA[t] = prod_{s=0}^{t} dA[s]
-        #   h[t]    = cumA[t] * cumsum(dBu / cumA, dim=1)[t]
-        log_dA   = torch.log(dA.clamp(min=1e-38))          # [B,L,D,N]
-        log_cumA = torch.cumsum(log_dA, dim=1)              # [B,L,D,N]
-        cumA     = torch.exp(log_cumA)                      # [B,L,D,N]
-        h = cumA * torch.cumsum(dBu * torch.exp(-log_cumA), dim=1)  # [B,L,D,N]
-
-        # Output: y[t] = C[t] @ h[t] + D * u[t]
-        y_seq = (Cm.unsqueeze(2) * h).sum(-1) + self.D * u  # [B,L,D]
-        y = self.out_proj(y_seq * F.silu(z))
-        return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
+        B, L, D = x.shape; N = self.state_dim; xz = self.in_proj(x); u, z = xz.chunk(2, -1); params = self.x_proj(u); dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1); delta = F.softplus(self.dt_proj(dt_raw)).clamp(max=10); A = -torch.exp(self.A_log.float()).clamp(max=1e4)
+        h = x.new_zeros(B, D, N); ys = []
+        for t in range(L):
+            dt, Bt, Ct, ut = delta[:, t], Bm[:, t], Cm[:, t], u[:, t]
+            dA = torch.exp((dt.unsqueeze(-1) * A.unsqueeze(0)).clamp(-30, 30)); dB = dt.unsqueeze(-1) * Bt.unsqueeze(1); h = dA * h + dB * ut.unsqueeze(-1); ys.append((Ct.unsqueeze(1) * h).sum(-1) + self.D * ut)
+        y = self.out_proj(torch.stack(ys, 1) * F.silu(z)); return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
 
 
 class FastMambaScan1D(nn.Module):
