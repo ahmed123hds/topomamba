@@ -603,9 +603,11 @@ class FastTopoMambaFoundation(nn.Module):
         self.register_buffer("region_indices", geometry["region_indices"].long(), persistent=True)
         self.register_buffer("region_patch_mask", geometry["region_patch_mask"].bool(), persistent=True)
         self.register_buffer("region_coords_hw", geometry["region_coords_hw"].long(), persistent=True)
-        self.register_buffer("region_centers_xy", geometry["region_centers_xy"].float(), persistent=True)
-        self.register_buffer("graph_pe", laplacian_pe(geometry["region_centers_xy"], args.graph_pe_dim, args.knn_k).float(), persistent=True)
-        near, far = build_topology_masks(geometry["region_centers_xy"])
+        # One-time CPU pre-calculations
+        cpu_centers = geometry["region_centers_xy"].cpu().float()
+        self.register_buffer("graph_pe", laplacian_pe(cpu_centers, args.graph_pe_dim, args.knn_k).float(), persistent=True)
+        
+        near, far = build_topology_masks(cpu_centers)
         self.has_topo_near = bool(near.any().item())
         self.has_topo_far = bool(far.any().item())
         self.register_buffer("topo_near_mask", near, persistent=False)
