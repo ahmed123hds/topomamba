@@ -823,6 +823,8 @@ def extract_embeddings(model, loader, device, args, max_samples=None):
         zs.append(z.cpu())
         ys.append(y.cpu())
         seen += int(z.shape[0])
+        if seen % 512 == 0:
+             master_print(f"[ANALYSIS] Extracted {seen} samples...")
         if max_samples and seen >= max_samples:
             break
     z, y = torch.cat(zs, 0), torch.cat(ys, 0).view(-1)
@@ -830,16 +832,24 @@ def extract_embeddings(model, loader, device, args, max_samples=None):
 
 
 def knn_accuracy(train_z, train_y, val_z, val_y, k=5):
+    master_print(f"[ANALYSIS] Computing kNN accuracy (k={k}) for {val_z.shape[0]} samples...")
     train_z = F.normalize(train_z.float(), dim=-1, eps=1e-6)
     val_z = F.normalize(val_z.float(), dim=-1, eps=1e-6)
-    idx = (val_z @ train_z.t()).topk(k=min(k, train_z.shape[0]), dim=1).indices
-    neigh = train_y[idx]
-    preds = []
-    for i in range(neigh.shape[0]):
-        vals, counts = torch.unique(neigh[i], return_counts=True)
-        preds.append(vals[torch.argmax(counts)])
-    pred = torch.stack(preds)
-    return float((pred == val_y).float().mean() * 100.0)
+    # Compute similarity matrix [Val, Train]
+    dist = val_z @ train_z.t()
+    # Get top-k indices
+    idx = dist.topk(k=min(k, train_z.shape[0]), dim=1).indices
+    # Retrieve labels
+    neigh = train_y[idx] # [Val, K]
+    # Vectorized mode (majority vote)
+    if k == 1:
+        pred = neigh.squeeze(-1)
+    else:
+        # torch.mode is much faster than a Python loop
+        pred = torch.mode(neigh, dim=1).values
+    acc = float((pred == val_y).float().mean() * 100.0)
+    master_print(f"[ANALYSIS] kNN Accuracy: {acc:.2f}%")
+    return acc
 
 
 def save_pca_plot(z, y, path, title):
