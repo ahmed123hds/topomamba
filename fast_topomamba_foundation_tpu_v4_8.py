@@ -990,6 +990,9 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
             if use_xla:
                 xm.mark_step()
 
+        if use_xla and step % 10 == 0:
+            master_print(f"[{phase.upper()} {epoch:03d}] Step {step} done...")
+
         vals = torch.stack([torch.nan_to_num(out[k].detach().float(), nan=0.0, posinf=1e4, neginf=-1e4) for k in keys])
         meter[:-1] += vals
         meter[-1] += 1.0
