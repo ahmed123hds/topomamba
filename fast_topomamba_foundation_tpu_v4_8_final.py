@@ -419,19 +419,112 @@ def build_patch_encoder(args, n_channels, patch_grid_hw):
     return DenseTorchvisionPatchEncoder(args.patch_encoder, args.pretrained, args.patch_embed_dim, patch_grid_hw)
 
 
-class SlowSelectiveScan1D(nn.Module):
+class LoopSelectiveScan1D(nn.Module):
+    """Reference selective-scan implementation. Stable, but slow on TPU.
+
+    Keep this only as a fallback/debug backend. The default TPU path below uses
+    StableMatrixSelectiveScan1D, which removes the Python loop over sequence
+    length without using the numerically dangerous cumprod/cumsum division trick.
+    """
     def __init__(self, dim, state_dim=48, dt_rank=24):
-        super().__init__(); self.state_dim = state_dim; self.dt_rank = dt_rank
-        self.in_proj = nn.Linear(dim, 2 * dim, bias=False); self.x_proj = nn.Linear(dim, dt_rank + 2 * state_dim, bias=False); self.dt_proj = nn.Linear(dt_rank, dim)
+        super().__init__()
+        self.state_dim = state_dim
+        self.dt_rank = dt_rank
+        self.in_proj = nn.Linear(dim, 2 * dim, bias=False)
+        self.x_proj = nn.Linear(dim, dt_rank + 2 * state_dim, bias=False)
+        self.dt_proj = nn.Linear(dt_rank, dim)
         nn.init.uniform_(self.dt_proj.bias, -4, -2)
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1).float().unsqueeze(0).repeat(dim, 1))); self.D = nn.Parameter(torch.ones(dim)); self.out_proj = nn.Linear(dim, dim, bias=False); self.norm = nn.LayerNorm(dim)
+        self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1).float().unsqueeze(0).repeat(dim, 1)))
+        self.D = nn.Parameter(torch.ones(dim))
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.norm = nn.LayerNorm(dim)
+
     def forward(self, x):
-        B, L, D = x.shape; N = self.state_dim; xz = self.in_proj(x); u, z = xz.chunk(2, -1); params = self.x_proj(u); dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1); delta = F.softplus(self.dt_proj(dt_raw)).clamp(max=10); A = -torch.exp(self.A_log.float()).clamp(max=1e4)
-        h = x.new_zeros(B, D, N); ys = []
+        B, L, D = x.shape
+        N = self.state_dim
+        xz = self.in_proj(x)
+        u, z = xz.chunk(2, -1)
+        params = self.x_proj(u)
+        dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1)
+        delta = F.softplus(self.dt_proj(dt_raw)).clamp(min=1e-4, max=2.0)
+        A = -torch.exp(self.A_log.float()).clamp(max=1e4)
+
+        h = x.new_zeros(B, D, N).float()
+        ys = []
         for t in range(L):
-            dt, Bt, Ct, ut = delta[:, t], Bm[:, t], Cm[:, t], u[:, t]
-            dA = torch.exp((dt.unsqueeze(-1) * A.unsqueeze(0)).clamp(-30, 30)); dB = dt.unsqueeze(-1) * Bt.unsqueeze(1); h = dA * h + dB * ut.unsqueeze(-1); ys.append((Ct.unsqueeze(1) * h).sum(-1) + self.D * ut)
-        y = self.out_proj(torch.stack(ys, 1) * F.silu(z)); return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
+            dt = delta[:, t].float()
+            Bt = Bm[:, t].float()
+            Ct = Cm[:, t].float()
+            ut = u[:, t].float()
+            dA = torch.exp((dt.unsqueeze(-1) * A.unsqueeze(0)).clamp(-30.0, 0.0))
+            dB = dt.unsqueeze(-1) * Bt.unsqueeze(1)
+            h = dA * h + dB * ut.unsqueeze(-1)
+            ys.append((Ct.unsqueeze(1) * h).sum(-1) + self.D.float() * ut)
+        y = torch.stack(ys, 1).to(x.dtype) * F.silu(z)
+        y = self.out_proj(y)
+        return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
+
+
+class StableMatrixSelectiveScan1D(nn.Module):
+    """TPU-friendly selective scan using a causal transition matrix.
+
+    Recurrence:
+        h_t = a_t h_{t-1} + b_t
+
+    Instead of the unstable vectorization
+        cumA * cumsum(b / cumA)
+    we build the causal coefficient
+        exp(S_t - S_j),  j <= t, where S_t = sum_{k<=t} log(a_k).
+
+    Since S_t - S_j <= 0, the exponential is always in [0, 1]. No division by
+    tiny cumulative products, no BF16 overflow, and no Python loop over t. This
+    is fast enough here because row/column lengths are the region-grid height or
+    width, usually small for 224x224 images. Human civilization survives one
+    more tensor contraction.
+    """
+    def __init__(self, dim, state_dim=48, dt_rank=24):
+        super().__init__()
+        self.state_dim = state_dim
+        self.dt_rank = dt_rank
+        self.in_proj = nn.Linear(dim, 2 * dim, bias=False)
+        self.x_proj = nn.Linear(dim, dt_rank + 2 * state_dim, bias=False)
+        self.dt_proj = nn.Linear(dt_rank, dim)
+        nn.init.uniform_(self.dt_proj.bias, -4, -2)
+        self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1).float().unsqueeze(0).repeat(dim, 1)))
+        self.D = nn.Parameter(torch.ones(dim))
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        B, L, D = x.shape
+        N = self.state_dim
+
+        xz = self.in_proj(x)
+        u, z = xz.chunk(2, -1)
+        params = self.x_proj(u)
+        dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1)
+
+        # Keep the scan math in fp32. XLA may store tensors in BF16 because of
+        # XLA_USE_BF16, but these explicit fp32 casts prevent the old overflow
+        # path and make exp/log behavior much less stupid.
+        u32 = u.float()
+        delta = F.softplus(self.dt_proj(dt_raw)).float().clamp(min=1e-4, max=2.0)
+        A = -torch.exp(self.A_log.float()).clamp(max=1e4)                         # [D, N]
+        log_a = (delta.unsqueeze(-1) * A.view(1, 1, D, N)).clamp(-30.0, 0.0)       # [B, L, D, N]
+        b = delta.unsqueeze(-1) * Bm.float().unsqueeze(2) * u32.unsqueeze(-1)      # [B, L, D, N]
+
+        prefix = torch.cumsum(log_a, dim=1)                                       # [B, L, D, N]
+        # transition[t, j] = prod_{k=j+1..t} a_k = exp(prefix[t] - prefix[j])
+        diff = prefix.unsqueeze(2) - prefix.unsqueeze(1)                          # [B, L, L, D, N]
+        causal = torch.tril(torch.ones(L, L, device=x.device, dtype=torch.bool)).view(1, L, L, 1, 1)
+        coeff = torch.exp(torch.where(causal, diff, torch.full_like(diff, -30.0))).to(b.dtype)
+        coeff = coeff * causal.to(b.dtype)
+        h = (coeff * b.unsqueeze(1)).sum(dim=2)                                   # [B, L, D, N]
+
+        y = (Cm.float().unsqueeze(2) * h).sum(-1) + self.D.float().view(1, 1, D) * u32
+        y = y.to(x.dtype) * F.silu(z)
+        y = self.out_proj(y)
+        return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
 
 
 class FastMambaScan1D(nn.Module):
@@ -445,8 +538,11 @@ class FastMambaScan1D(nn.Module):
 
 
 def build_scan(args, dim):
-    if args.scan_backend == "mamba": return FastMambaScan1D(dim, args.vmamba_state_dim, args.vmamba_conv_kernel, args.mamba_expand, args.dropout)
-    return SlowSelectiveScan1D(dim, args.vmamba_state_dim, args.vmamba_dt_rank)
+    if args.scan_backend == "mamba":
+        return FastMambaScan1D(dim, args.vmamba_state_dim, args.vmamba_conv_kernel, args.mamba_expand, args.dropout)
+    if getattr(args, "torch_scan_impl", "matrix") == "loop":
+        return LoopSelectiveScan1D(dim, args.vmamba_state_dim, args.vmamba_dt_rank)
+    return StableMatrixSelectiveScan1D(dim, args.vmamba_state_dim, args.vmamba_dt_rank)
 
 
 class VMambaCrossScanBlock(nn.Module):
@@ -675,11 +771,28 @@ class FastTopoMambaFoundation(nn.Module):
         seq_m = torch.where(mask.unsqueeze(-1), self.mask_token.to(seq.dtype), seq)
 
         recon = torch.nan_to_num(self.recon_head(self.spatial_encode(seq_m)), nan=0.0, posinf=1.0, neginf=-1.0)
-        recon_mse = F.mse_loss(recon[mask].float(), target[mask].float())
-        recon_cos = (1.0 - F.cosine_similarity(recon[mask].float(), target[mask].float(), dim=-1, eps=1e-6)).mean()
 
-        o2 = self.encode_image(x2)
-        contrastive = nt_xent(o1["embedding"], o2["embedding"], self.args.temperature)
+        # TPU/XLA dislikes boolean indexing such as recon[mask]; it can create
+        # dynamic shapes and slow graphs. Use fixed-shape masked reductions.
+        mask_f = mask.unsqueeze(-1).to(recon.dtype)
+        denom = (mask_f.sum() * recon.shape[-1]).clamp_min(1.0)
+        diff = (recon.float() - target.float())
+        recon_mse = ((diff * diff) * mask_f.float()).sum() / denom.float()
+
+        cos_per_region = F.cosine_similarity(recon.float(), target.float(), dim=-1, eps=1e-6)
+        recon_cos = ((1.0 - cos_per_region) * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+        # Contrastive branch is useful, but it doubles the encoder work. If you
+        # set --w_contrastive 0, this branch is skipped completely. Apparently
+        # arithmetic still costs time, a tragedy humanity keeps rediscovering.
+        zero = recon_mse * 0.0
+        if float(self.args.w_contrastive) > 0.0:
+            o2 = self.encode_image(x2)
+            contrastive = nt_xent(o1["embedding"], o2["embedding"], self.args.temperature)
+        else:
+            o2 = None
+            contrastive = zero
+
         topo = topology_loss_static(
             o1["region_tokens"],
             self.topo_near_mask,
@@ -695,12 +808,21 @@ class FastTopoMambaFoundation(nn.Module):
         )
 
         with torch.no_grad():
-            z1, z2 = o1["embedding"].float(), o2["embedding"].float()
-            pos_cos = F.cosine_similarity(z1, z2, dim=-1, eps=1e-6).mean()
+            z1 = o1["embedding"].float()
+            if o2 is not None:
+                z2 = o2["embedding"].float()
+                pos_cos = F.cosine_similarity(z1, z2, dim=-1, eps=1e-6).mean()
+            else:
+                pos_cos = zero.detach()
             zn = F.normalize(z1, dim=-1, eps=1e-6)
             sim = zn @ zn.t()
-            neg_cos = sim[~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)].mean() if sim.shape[0] > 1 else sim.sum() * 0
-            emb_var = z1.var(0).mean()
+            n = sim.shape[0]
+            if n > 1:
+                eye = torch.eye(n, dtype=sim.dtype, device=sim.device)
+                neg_cos = (sim * (1.0 - eye)).sum() / float(n * (n - 1))
+            else:
+                neg_cos = sim.sum() * 0.0
+            emb_var = z1.var(0, unbiased=False).mean()
 
         return {
             "total": total,
@@ -716,7 +838,6 @@ class FastTopoMambaFoundation(nn.Module):
             "region_reconstructed": recon.detach(),
             "region_mask": mask.detach(),
         }
-
 
 # =============================================================================
 # TPU / train / eval helpers
@@ -1106,6 +1227,7 @@ def _worker(rank, args):
             "patch_encoder": args.patch_encoder,
             "pretrained": args.pretrained,
             "scan_backend": args.scan_backend,
+            "torch_scan_impl": getattr(args, "torch_scan_impl", "matrix"),
             "has_mamba_ssm": HAS_MAMBA_SSM,
             "has_xla": HAS_XLA,
             "world_size": world,
@@ -1297,6 +1419,7 @@ def build_parser():
     p.add_argument("--vmamba_conv_kernel", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--scan_backend", type=str, default="torch", choices=["mamba", "torch"])
+    p.add_argument("--torch_scan_impl", type=str, default="matrix", choices=["matrix", "loop"], help="matrix is stable+fast on TPU; loop is reference/debug only")
     p.add_argument("--mamba_expand", type=int, default=2)
 
     p.add_argument("--mask_ratio", type=float, default=0.50)
