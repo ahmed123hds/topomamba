@@ -426,12 +426,36 @@ class SlowSelectiveScan1D(nn.Module):
         nn.init.uniform_(self.dt_proj.bias, -4, -2)
         self.A_log = nn.Parameter(torch.log(torch.arange(1, state_dim + 1).float().unsqueeze(0).repeat(dim, 1))); self.D = nn.Parameter(torch.ones(dim)); self.out_proj = nn.Linear(dim, dim, bias=False); self.norm = nn.LayerNorm(dim)
     def forward(self, x):
-        B, L, D = x.shape; N = self.state_dim; xz = self.in_proj(x); u, z = xz.chunk(2, -1); params = self.x_proj(u); dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1); delta = F.softplus(self.dt_proj(dt_raw)).clamp(max=10); A = -torch.exp(self.A_log.float()).clamp(max=1e4)
-        h = x.new_zeros(B, D, N); ys = []
-        for t in range(L):
-            dt, Bt, Ct, ut = delta[:, t], Bm[:, t], Cm[:, t], u[:, t]
-            dA = torch.exp((dt.unsqueeze(-1) * A.unsqueeze(0)).clamp(-30, 30)); dB = dt.unsqueeze(-1) * Bt.unsqueeze(1); h = dA * h + dB * ut.unsqueeze(-1); ys.append((Ct.unsqueeze(1) * h).sum(-1) + self.D * ut)
-        y = self.out_proj(torch.stack(ys, 1) * F.silu(z)); return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
+        B, L, D = x.shape
+        N = self.state_dim
+        xz = self.in_proj(x)
+        u, z = xz.chunk(2, -1)                                     # u,z: [B,L,D]
+        params = self.x_proj(u)
+        dt_raw, Bm, Cm = params.split([self.dt_rank, N, N], -1)
+        delta = F.softplus(self.dt_proj(dt_raw)).clamp(max=10)     # [B,L,D]
+        A = -torch.exp(self.A_log.float()).clamp(max=1e4)           # [D,N]
+
+        # --- Vectorized scan (no Python for-loop → XLA-friendly static graph) ---
+        # dA[b,t,d,n] = exp(delta[b,t,d] * A[d,n])
+        dA = torch.exp(
+            (delta.unsqueeze(-1) * A[None, None]).clamp(-30, 30)
+        )  # [B,L,D,N]
+        # dB*u: outer product over N and D dims
+        dBu = (delta.unsqueeze(-1) * Bm.unsqueeze(2)) * u.unsqueeze(-1)  # [B,L,D,N]
+
+        # Linear recurrence h[t] = dA[t]*h[t-1] + dBu[t], h[-1]=0
+        # Solved via log-space prefix-product cumsum (fully vectorised):
+        #   cumA[t] = prod_{s=0}^{t} dA[s]
+        #   h[t]    = cumA[t] * cumsum(dBu / cumA, dim=1)[t]
+        log_dA   = torch.log(dA.clamp(min=1e-38))          # [B,L,D,N]
+        log_cumA = torch.cumsum(log_dA, dim=1)              # [B,L,D,N]
+        cumA     = torch.exp(log_cumA)                      # [B,L,D,N]
+        h = cumA * torch.cumsum(dBu * torch.exp(-log_cumA), dim=1)  # [B,L,D,N]
+
+        # Output: y[t] = C[t] @ h[t] + D * u[t]
+        y_seq = (Cm.unsqueeze(2) * h).sum(-1) + self.D * u  # [B,L,D]
+        y = self.out_proj(y_seq * F.silu(z))
+        return self.norm(x + torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0))
 
 
 class FastMambaScan1D(nn.Module):
@@ -928,9 +952,15 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
     keys = ["total", "recon_mse", "recon_cos", "contrastive", "topology", "emb_var", "pos_cos", "neg_cos"]
     use_xla = is_xla_device(device)
     meter = torch.zeros(len(keys) + 1, device=device, dtype=torch.float32)
-    iterator = loader if use_xla else tqdm(loader, desc=f"{'Train' if train else 'Val'} {epoch:03d}", disable=not args.show_progress, leave=train)
+    phase = "Train" if train else "Val"
+    iterator = loader if use_xla else tqdm(loader, desc=f"{phase} {epoch:03d}", disable=not args.show_progress, leave=train)
     if train:
         optimizer.zero_grad(set_to_none=True)
+
+    # Stash for deferred CPU save (avoids mid-graph .cpu() sync on TPU)
+    _save_example_tensors = None
+
+    master_print(f"[{phase.upper()} {epoch:03d}] Starting epoch...")
 
     for step, batch in enumerate(iterator, 1):
         x = batch["image"] if use_xla else batch["image"].to(device, non_blocking=True)
@@ -947,6 +977,8 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 xm.mark_step()
+                if step == 1:
+                    master_print(f"[{phase.upper()} {epoch:03d}] Step 1 mark_step done — XLA graph compiled.")
             else:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -955,28 +987,38 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
             with torch.no_grad():
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=bool(args.amp and device.type == "cuda")):
                     out = model.forward_ssl(x1, x2)
+            if use_xla:
+                xm.mark_step()
 
         vals = torch.stack([torch.nan_to_num(out[k].detach().float(), nan=0.0, posinf=1e4, neginf=-1e4) for k in keys])
         meter[:-1] += vals
         meter[-1] += 1.0
 
+        # Stash tensors for deferred save — do NOT call .cpu() inside the XLA graph
         if train and step == 1 and args.save_examples_every > 0 and epoch % args.save_examples_every == 0 and is_master_process():
-            ex_path = Path(args.output_dir) / "examples" / f"region_recon_epoch_{epoch:03d}.pt"
-            ex_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
+            _save_example_tensors = {
                 "epoch": epoch,
-                "region_original": out["region_original"][:8].cpu(),
-                "region_reconstructed": out["region_reconstructed"][:8].cpu(),
-                "region_mask": out["region_mask"][:8].cpu(),
-            }, ex_path)
+                "region_original": out["region_original"][:8].detach(),
+                "region_reconstructed": out["region_reconstructed"][:8].detach(),
+                "region_mask": out["region_mask"][:8].detach(),
+            }
 
         if not use_xla and hasattr(iterator, "set_postfix"):
             denom = max(1.0, float(meter[-1].detach().cpu()))
             iterator.set_postfix(loss=f"{float(meter[0].detach().cpu())/denom:.4f}", mse=f"{float(meter[1].detach().cpu())/denom:.4f}")
 
+    # All steps done — reduce and sync before .cpu()
     if use_xla:
         meter = xm.all_reduce(xm.REDUCE_SUM, meter)
         xm.mark_step()
+        master_print(f"[{phase.upper()} {epoch:03d}] All-reduce done.")
+
+    # Now safe to move tensors to CPU
+    if _save_example_tensors is not None:
+        ex_path = Path(args.output_dir) / "examples" / f"region_recon_epoch_{epoch:03d}.pt"
+        ex_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({k: (v.cpu() if torch.is_tensor(v) else v) for k, v in _save_example_tensors.items()}, ex_path)
+
     arr = meter.detach().cpu().numpy()
     denom = max(1.0, float(arr[-1]))
     out = {k: float(arr[i] / denom) for i, k in enumerate(keys)}
@@ -1008,6 +1050,11 @@ def _worker(rank, args):
         # Fused mamba_ssm kernels are CUDA-oriented. On TPU, use the pure torch scan.
         if args.scan_backend == "mamba":
             args.scan_backend = "torch"
+        # DataLoader workers forked from xmp.spawn conflict with PJRT → deadlock.
+        # Force single-threaded data loading on TPU.
+        if args.num_workers > 0:
+            master_print(f"[INIT] TPU detected: overriding num_workers {args.num_workers} → 0 (fork/PJRT deadlock prevention)")
+            args.num_workers = 0
     else:
         if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available() and not args.cpu):
             device = torch.device("cuda")
@@ -1016,6 +1063,7 @@ def _worker(rank, args):
         world = 1
         ordinal = 0
 
+    master_print(f"[INIT] rank={rank} ordinal={ordinal} world_size={world} device={device}")
     seed_everything(int(args.seed) + ordinal)
     outdir = ensure_dir(args.output_dir) if is_master_process() else Path(args.output_dir)
     if is_master_process():
@@ -1023,14 +1071,19 @@ def _worker(rank, args):
             ensure_dir(outdir / d)
     if use_xla:
         xm.rendezvous("dirs_ready")
+        master_print("[INIT] rendezvous 'dirs_ready' passed.")
 
     if args.scan_backend == "mamba" and not HAS_MAMBA_SSM:
         raise ImportError("mamba_ssm unavailable. Use --scan_backend torch or install mamba-ssm.")
 
+    master_print("[INIT] Building datasets...")
     train_ds, val_ds, n_channels, n_classes = build_datasets(args)
     args.n_channels = int(n_channels)
     args.n_classes = int(n_classes)
+    master_print(f"[INIT] Dataset ready: train={len(train_ds)} val={len(val_ds)} classes={n_classes} channels={n_channels}")
+    master_print("[INIT] Building geometry...")
     geometry = build_geometry(args)
+    master_print(f"[INIT] Geometry: num_regions={geometry['num_regions']} patches_per_region={geometry['patches_per_region']}")
 
     if is_master_process():
         save_json(outdir / "config.json", {
@@ -1076,8 +1129,13 @@ def _worker(rank, args):
     eval_train_loader = make_loader(train_ds, args.eval_batch_size, shuffle=False, drop_last=False, args=args, sampler=eval_train_sampler, device=device)
     eval_val_loader = make_loader(val_ds, args.eval_batch_size, shuffle=False, drop_last=False, args=args, sampler=eval_val_sampler, device=device)
 
+    master_print("[INIT] Building model...")
     model = FastTopoMambaFoundation(args, n_channels, geometry).to(device)
-    master_print(f"[INFO] Trainable parameters: {count_parameters(model):.2f}M")
+    master_print(f"[INIT] Trainable parameters: {count_parameters(model):.2f}M")
+    if use_xla:
+        # Warm the device allocation so graph compilation starts clean
+        xm.mark_step()
+        master_print("[INIT] Model moved to TPU, mark_step done.")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, eps=1e-8)
     scheduler = cosine_warmup_scheduler(
@@ -1087,6 +1145,9 @@ def _worker(rank, args):
         args.min_lr_ratio,
     )
     scaler = None  # XLA does not use CUDA GradScaler; CUDA path uses normal fp32 here for stability.
+    master_print(f"[INIT] Optimizer=AdamW lr={args.lr} wd={args.weight_decay} | batch_size={args.batch_size} world={world} global_batch={args.batch_size * world}")
+    master_print(f"[INIT] Train steps/epoch={len(train_loader)} | warmup_epochs={args.warmup_epochs} total_epochs={args.epochs}")
+    master_print("[INIT] *** XLA graph will compile on the first forward+backward pass. This may take 5-15 min. Please wait... ***")
 
     history = []
     best_metric = -float("inf") if args.best_metric == "knn" else float("inf")
