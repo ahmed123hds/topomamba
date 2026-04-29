@@ -1305,7 +1305,7 @@ def _worker(rank, args):
         for k, v in va.items():
             row[f"val_{k}"] = v
 
-        if epoch == 1 or (args.analysis_every > 0 and epoch % args.analysis_every == 0):
+        if True:  # Compute analysis (kNN) every epoch
             et_loader = pl.MpDeviceLoader(eval_train_loader, device) if use_xla else eval_train_loader
             ev_loader = pl.MpDeviceLoader(eval_val_loader, device) if use_xla else eval_val_loader
             tz, ty = extract_embeddings(model, et_loader, device, args, args.max_eval_samples)
