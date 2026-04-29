@@ -948,8 +948,11 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
     # Stash for deferred CPU save (avoids mid-graph .cpu() sync on TPU)
     _save_example_tensors = None
 
+    import time
+    epoch_start_time = time.time()
     master_print(f"[{phase.upper()} {epoch:03d}] Starting epoch...")
 
+    last_print_time = time.time()
     for step, batch in enumerate(iterator, 1):
         x = batch["image"] if use_xla else batch["image"].to(device, non_blocking=True)
         x1, x2 = make_views(x, args)
@@ -979,7 +982,14 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
                 xm.mark_step()
 
         if use_xla and step % 10 == 0:
-            master_print(f"[{phase.upper()} {epoch:03d}] Step {step} done...")
+            curr_time = time.time()
+            time_for_10 = curr_time - last_print_time
+            avg_step_time = time_for_10 / 10.0
+            world = xm.xrt_world_size() if use_xla else 1
+            global_b = x.shape[0] * world
+            imgs_sec = global_b / avg_step_time if avg_step_time > 0 else 0.0
+            master_print(f"[{phase.upper()} {epoch:03d}] Step {step} done | {avg_step_time:.2f}s/step | {imgs_sec:.1f} imgs/sec")
+            last_print_time = curr_time
 
         vals = torch.stack([torch.nan_to_num(out[k].detach().float(), nan=0.0, posinf=1e4, neginf=-1e4) for k in keys])
         meter[:-1] += vals
@@ -1003,6 +1013,9 @@ def run_epoch(model, loader, optimizer, scheduler, scaler, device, args, train, 
         meter = xm.all_reduce(xm.REDUCE_SUM, meter)
         xm.mark_step()
         master_print(f"[{phase.upper()} {epoch:03d}] All-reduce done.")
+
+    epoch_duration = time.time() - epoch_start_time
+    master_print(f"[{phase.upper()} {epoch:03d}] Finished in {epoch_duration:.2f}s")
 
     # Now safe to move tensors to CPU
     if _save_example_tensors is not None:
